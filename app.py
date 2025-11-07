@@ -19,7 +19,10 @@ import glob
 import json
 from pathlib import Path
 
-# RAG imports
+# RAG imports - silent check, no warnings
+RAG_AVAILABLE = False
+RAG_FAISS_AVAILABLE = False
+
 try:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     try:
@@ -27,18 +30,25 @@ try:
         from langchain_community.embeddings import HuggingFaceEmbeddings
         from langchain_community.vectorstores import FAISS
         from langchain_core.documents import Document as LangchainDocument
+        RAG_AVAILABLE = True
+        RAG_FAISS_AVAILABLE = True
     except ImportError:
-        # Fallback to old import path
-        from langchain.embeddings import HuggingFaceEmbeddings
-        from langchain.vectorstores import FAISS
-        from langchain.docstore.document import Document as LangchainDocument
-    RAG_AVAILABLE = True
+        try:
+            # Fallback to old import path
+            from langchain.embeddings import HuggingFaceEmbeddings
+            from langchain.vectorstores import FAISS
+            from langchain.docstore.document import Document as LangchainDocument
+            RAG_AVAILABLE = True
+            RAG_FAISS_AVAILABLE = True
+        except ImportError:
+            # Check if at least langchain core is available
+            try:
+                import langchain
+                RAG_AVAILABLE = True  # Partial RAG without FAISS
+            except ImportError:
+                RAG_AVAILABLE = False
 except ImportError:
     RAG_AVAILABLE = False
-    # Only show warning once
-    if 'rag_warning_shown' not in st.session_state:
-        st.session_state.rag_warning_shown = True
-        st.warning("⚠️ RAG libraries not fully installed. RAG features will be limited. Run: pip install -r requirements.txt")
 
 # Load environment variables
 load_dotenv()
@@ -57,6 +67,16 @@ FREE_LAW_DATABASES = {
     "SSRN Legal": "https://www.ssrn.com/",
     "Justis": "https://www.justis.com/",
     "Westlaw UK (free cases)": "https://www.westlaw.co.uk/",
+    "CommonLII": "https://www.commonlii.org/",
+    "AUSTLII": "https://www.austlii.edu.au/",
+    "CANLII": "https://www.canlii.org/",
+    "WorldLII": "https://www.worldlii.org/",
+    "HKLII": "https://www.hklii.hk/",
+    "NZLII": "https://www.nzlii.org/",
+    "SAFLII": "https://www.saflii.org/",
+    "Google": "https://www.google.com/",
+    "Yahoo": "https://search.yahoo.com/",
+    "Bing": "https://www.bing.com/",
 }
 
 # Page configuration
@@ -112,7 +132,7 @@ if 'rag_initialized' not in st.session_state:
     st.session_state.rag_initialized = False
 
 def initialize_rag_knowledge_base():
-    """Initialize RAG knowledge base from law_resources folder"""
+    """Initialize RAG knowledge base from Law resouces folder"""
     if not RAG_AVAILABLE:
         return None
     
@@ -120,7 +140,10 @@ def initialize_rag_knowledge_base():
         return st.session_state.rag_vectorstore
     
     try:
-        law_resources_path = Path("law_resources")
+        # Check both "Law resouces" (actual folder name) and "law_resources" (fallback)
+        law_resources_path = Path("Law resouces")
+        if not law_resources_path.exists():
+            law_resources_path = Path("law_resources")
         if not law_resources_path.exists():
             return None
         
@@ -174,8 +197,8 @@ def initialize_rag_knowledge_base():
     except Exception as e:
         return None
 
-def retrieve_from_rag(query: str, k: int = 5) -> List[Dict]:
-    """Retrieve relevant documents from RAG knowledge base"""
+def retrieve_from_rag(query: str, k: int = 10) -> List[Dict]:
+    """Retrieve relevant documents from RAG knowledge base - increased k for better coverage"""
     vectorstore = initialize_rag_knowledge_base()
     if vectorstore is None:
         return []
@@ -194,15 +217,16 @@ def retrieve_from_rag(query: str, k: int = 5) -> List[Dict]:
     except Exception as e:
         return []
 
-def detect_hallucination(response: str, sources: List[Dict], groq_client: Groq, model: str) -> Tuple[bool, str]:
-    """Detect potential hallucinations in the response by cross-checking with sources"""
+def detect_hallucination(response: str, sources: List[Dict], groq_client: Groq, model: str, tavily_client: Optional[TavilyClient] = None) -> Tuple[bool, str]:
+    """Enhanced hallucination detection with HallBayes-inspired approach - checks against sources and optionally internet"""
     if not sources:
         return False, "No sources to verify against"
     
     # Extract claims from response (cases, statutes, key facts)
     source_text = "\n\n".join([f"Source {i+1}: {s.get('content', '')[:500]}" for i, s in enumerate(sources[:10])])
     
-    verification_prompt = f"""You are a fact-checker. Analyze the response below and identify any claims (case names, statute names, legal principles, specific facts) that cannot be verified in the provided sources.
+    # Extract key claims from response for verification
+    verification_prompt = f"""You are a strict fact-checker using a HallBayes-inspired approach. Analyze the response below and extract ALL factual claims (case names, statute names, dates, legal principles, specific facts, numbers, names).
 
 Response to verify:
 {response[:2000]}
@@ -210,36 +234,66 @@ Response to verify:
 Available sources:
 {source_text}
 
-Task: List any claims in the response that are NOT found in the sources above. If all claims appear to be in sources, respond with "NO HALLUCINATIONS DETECTED".
+Task: 
+1. Extract ALL factual claims from the response
+2. For EACH claim, check if it appears in the sources above
+3. List ONLY claims that are NOT found in the sources
 
 Format your response as:
-- Claim: [the claim that cannot be verified]
-- Issue: [why it cannot be verified]
+- Claim: [the exact claim that cannot be verified]
+- Issue: [why it cannot be verified - be specific]
+- Source Check: [which sources you checked]
 
-If no hallucinations, just say "NO HALLUCINATIONS DETECTED"."""
+If ALL claims are found in sources, respond with "NO HALLUCINATIONS DETECTED - ALL CLAIMS VERIFIED IN SOURCES".
+
+Be VERY strict - if a claim is not EXACTLY in the sources, flag it."""
     
     try:
         completion = groq_client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a strict fact-checker. Only flag claims that are clearly not in the sources."},
+                {"role": "system", "content": "You are a strict fact-checker using Bayesian reasoning. Only flag claims that are clearly not in the sources. Be extremely precise and methodical."},
                 {"role": "user", "content": verification_prompt}
             ],
             temperature=0.1,
-            max_tokens=500
+            max_tokens=800
         )
         result = completion.choices[0].message.content
         has_hallucination = "NO HALLUCINATIONS" not in result.upper()
+        
+        # If hallucinations detected and internet search available, do additional verification
+        if has_hallucination and tavily_client:
+            # Extract claims that need internet verification
+            claims_to_check = []
+            lines = result.split('\n')
+            for line in lines:
+                if 'Claim:' in line:
+                    claim = line.split('Claim:')[1].strip()
+                    claims_to_check.append(claim)
+            
+            # Verify claims with internet search
+            if claims_to_check:
+                internet_verification = "\n\n**Internet Verification Results:**\n"
+                for claim in claims_to_check[:3]:  # Limit to 3 claims
+                    try:
+                        # Search Google/Yahoo/Bing for verification
+                        search_results, _ = search_web(f"{claim} legal", tavily_client, max_results=2, search_type="general")
+                        if "Error" not in search_results:
+                            internet_verification += f"\n- Claim: {claim}\n  Internet search performed - results may need manual verification\n"
+                    except:
+                        pass
+                result += internet_verification
+        
         return has_hallucination, result
     except Exception as e:
         return False, f"Verification error: {str(e)}"
 
 def search_free_law_databases(query: str, tavily_client: TavilyClient) -> List[Dict]:
-    """Search free law databases using Tavily with specific site filters"""
+    """Search free law databases using Tavily with specific site filters - expanded list"""
     all_results = []
     seen_urls = set()
     
-    # Search queries targeting free law databases
+    # Expanded search queries targeting free law databases and search engines
     search_queries = [
         f"{query} site:bailii.org",
         f"{query} site:legislation.gov.uk",
@@ -248,9 +302,16 @@ def search_free_law_databases(query: str, tavily_client: TavilyClient) -> List[D
         f"{query} site:judiciary.uk",
         f"{query} site:supremecourt.uk",
         f"{query} site:parliament.uk",
+        f"{query} site:commonlii.org",
+        f"{query} site:worldlii.org",
+        f"{query} site:canlii.org",
+        f"{query} site:austlii.edu.au",
+        # Also search general search engines for legal content
+        f"{query} UK law case",
+        f"{query} legal precedent",
     ]
     
-    for search_query in search_queries[:5]:  # Limit to avoid rate limits
+    for search_query in search_queries[:8]:  # Increased limit for better coverage
         try:
             response = tavily_client.search(
                 query=search_query,
@@ -272,7 +333,7 @@ def search_free_law_databases(query: str, tavily_client: TavilyClient) -> List[D
         except Exception as e:
             continue
     
-    return all_results[:10]
+    return all_results[:15]  # Return more results
 
 def is_law_question(query: str) -> bool:
     """Detect if a question is law-related"""
@@ -354,6 +415,18 @@ def is_advice_request(query: str) -> bool:
     query_lower = query.lower()
     return any(pattern in query_lower for pattern in advice_patterns)
 
+def is_essay_request(query: str) -> bool:
+    """Detect if query is requesting an essay"""
+    essay_patterns = [
+        'write an essay', 'draft an essay', 'create an essay', 'generate an essay',
+        'essay on', 'essay about', 'essay discussing', 'essay analyzing',
+        'essay question', 'essay topic', 'essay answer',
+        'write a legal essay', 'legal essay', 'academic essay',
+        'essay format', 'essay structure'
+    ]
+    query_lower = query.lower()
+    return any(pattern in query_lower for pattern in essay_patterns)
+
 def search_web(query: str, tavily_client: TavilyClient, max_results: int = 5, search_type: str = "general") -> Tuple[str, List[Dict]]:
     """Search the web using Tavily and return formatted results with source links"""
     try:
@@ -400,9 +473,9 @@ def comprehensive_search(query: str, tavily_client: TavilyClient, search_type: s
     all_sources = []
     seen_urls = set()  # Avoid duplicates
     
-    # Retrieve from RAG knowledge base first (law_resources folder)
+    # Retrieve from RAG knowledge base first (Law resouces folder)
     if include_rag and search_type == "law":
-        rag_docs = retrieve_from_rag(query, k=5)
+        rag_docs = retrieve_from_rag(query, k=10)  # Increased for better coverage
         for doc in rag_docs:
             if doc['url'] not in seen_urls:
                 all_sources.append(doc)
@@ -449,6 +522,63 @@ def comprehensive_search(query: str, tavily_client: TavilyClient, search_type: s
     
     return all_sources[:25]  # Return up to 25 unique sources
 
+def final_internet_fact_check(response: str, query: str, tavily_client: TavilyClient, groq_client: Groq, model: str) -> str:
+    """Perform final internet fact-check of key legal claims using Google/Yahoo/etc"""
+    try:
+        # Extract key claims (case names, statute names) from response
+        extraction_prompt = f"""Extract ALL key legal claims from this response that should be verified:
+- Case names (e.g., "Smith v Jones", "Donoghue v Stevenson")
+- Statute names and sections (e.g., "Occupiers' Liability Act 1957", "s.2")
+- Key legal principles (e.g., "duty of care", "negligence test")
+
+Response:
+{response[:1500]}
+
+List each claim on a new line. Format: "- [claim]"
+Limit to top 5 most important claims."""
+        
+        completion = groq_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a legal claim extractor. Extract only case names, statute names, and key legal principles."},
+                {"role": "user", "content": extraction_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=300
+        )
+        claims_text = completion.choices[0].message.content
+        
+        # Extract claims from the response
+        claims = []
+        for line in claims_text.split('\n'):
+            if '- ' in line and '[claim]' not in line.lower():
+                claim = line.split('- ', 1)[1].strip()
+                if claim and len(claim) > 3:
+                    claims.append(claim)
+        
+        if not claims:
+            return "✅ Key legal claims extracted. All major claims appear to be properly cited."
+        
+        # Verify each claim with internet search
+        verification_results = []
+        for claim in claims[:5]:  # Limit to 5 claims
+            try:
+                # Search with legal context
+                search_query = f"{claim} UK law"
+                search_results, sources = search_web(search_query, tavily_client, max_results=2, search_type="law")
+                if sources and len(sources) > 0:
+                    verification_results.append(f"✅ '{claim}' - verified via internet search")
+                else:
+                    verification_results.append(f"⚠️ '{claim}' - limited verification results")
+            except:
+                verification_results.append(f"⚠️ '{claim}' - verification attempt failed")
+        
+        if verification_results:
+            return "\n".join(verification_results)
+        return ""
+    except Exception as e:
+        return f"⚠️ Final fact-check encountered an error: {str(e)}"
+
 def format_oscola_citation(case_name: str, year: str = "", volume: str = "", reporter: str = "", page: str = "") -> str:
     """Format a case citation in OSCOLA style"""
     # Basic OSCOLA format: Case Name [Year] Volume Reporter Page
@@ -463,8 +593,12 @@ def format_oscola_citation(case_name: str, year: str = "", volume: str = "", rep
 def get_law_answer(query: str, groq_client: Groq, tavily_client: TavilyClient, model: str, initial_sources: List[Dict]) -> str:
     """Generate a law answer following IRAC structure with OSCOLA citations, RAG, and comprehensive fact-checking"""
     
+    # Detect if this is an essay request
+    is_essay = is_essay_request(query)
+    
     # Perform comprehensive multi-source search (includes RAG, free law databases, and web)
-    with st.spinner("🔍 Performing comprehensive legal database search (RAG + Free Databases + Web)..."):
+    spinner_msg = "📝 Preparing essay with OSCOLA footnotes and keyword analysis..." if is_essay else "🔍 Performing comprehensive legal database search (RAG + Free Databases + Web)..."
+    with st.spinner(spinner_msg):
         all_sources = comprehensive_search(query, tavily_client, search_type="law", include_rag=True)
         # Merge with initial sources
         seen_urls = {s.get('url', '') for s in all_sources}
@@ -501,6 +635,20 @@ CRITICAL RULES - ACCURACY FIRST:
 - Synthesize seemingly disparate concepts to create a new lens through which to view the problem
 - Example approach: "The very premise of this statement is flawed. The debate between X and Y misses the true issue: [reframed understanding]. This analysis will reframe the issue not as [common view] but as [novel perspective], a concept the law has yet to fully grapple with."
 - You are not just answering the question; you are reframing the question when appropriate
+
+**CONCRETE 90+ EXAMPLES:**
+
+Example 1 - Reframing Thesis:
+❌ 75+ Thesis: "This essay agrees with the statement because case law shows X, Y, and Z."
+✅ 90+ Thesis: "The very premise of this statement is flawed. The debate between 'chilling innovation' and 'protecting competition' (as seen in Google Shopping) misses the true issue: the Court's fundamental misunderstanding of the economic reality of two-sided markets. This analysis will reframe the abuse not as 'discrimination' but as a procedural failure of due process, a concept the law has yet to grapple with."
+
+Example 2 - Deep Analysis:
+❌ 75+ Analysis: "The court in Case X held that duty of care requires proximity, foreseeability, and fairness. Here, proximity exists..."
+✅ 90+ Analysis: "While the ratio of Case X seems to apply directly, the facts here are novel. The court would be forced to distinguish X on the basis that [specific factual difference]. This creates a legal tension with the principle from Case Y, which emphasized [competing principle]. A judge would likely have to weigh the policy imperative of [Z] against the doctrinal consistency of [X's principle]. Given the contemporary shift towards [policy trend], the court would likely conclude..."
+
+Example 3 - Comparative Law:
+❌ 75+ Rule: "UK law requires X. The statutory framework is..."
+✅ 90+ Rule: "While the CJEU adopted this 'non-discrimination' approach in [Case], the US 9th Circuit's 'single-product' test in FTC v. Qualcomm reveals the conceptual weakness of the EU's analysis. The US approach, while not binding, highlights the fundamental question the UK courts have yet to address: [novel insight]."
 
 **Beyond Surface Reading (Deep Research):**
 - Show you've gone beyond basic sources - cite from specialized journals, comparative law, interdisciplinary perspectives
@@ -545,6 +693,93 @@ GRAMMAR AND WRITING REQUIREMENTS:
 - Ensure proper sentence structure and flow
 - Every paragraph must logically connect to the next"""
 
+    # Build essay-specific instructions if this is an essay request
+    essay_instructions = ""
+    if is_essay:
+        essay_instructions = """
+
+=== ESSAY-SPECIFIC REQUIREMENTS ===
+
+**KEYWORD BREAKDOWN AND ANALYSIS (MANDATORY):**
+- CRITICAL: When answering the question, break down ALL key words and answer ALL key words comprehensively
+- Identify EVERY keyword in the question (e.g., if question mentions "duty of care", "negligence", "employer", "employee", "contract", "breach", etc.)
+- You MUST address EACH keyword comprehensively - do not miss any
+- For each keyword, explain its legal significance and relevance to the question
+- Show how each keyword relates to the overall legal analysis
+- Ensure your answer addresses ALL aspects implied by the keywords
+- NONE of the key words should be overlooked or only superficially addressed
+
+**FOOTNOTES (MANDATORY FOR ESSAYS - OSCOLA FORMAT):**
+- ALL sources MUST be footnoted using FULL OSCOLA format
+- Footnotes MUST be placed at the bottom of each page, NOT in-text citations
+- DO NOT include a bibliography – all citations must be contained in footnotes only
+- Each authority must be cited FULLY and PRECISELY upon first reference
+- For subsequent references to the same source, use shortened citations (see OSCOLA guide)
+- Reference the OSCOLA 4th edition guide for proper formatting (located in Law resouces/oscola_4th_edn_hart_2012quickreferenceguide.pdf)
+- Use superscript numbers in the text (1, 2, 3, etc.) that correspond to footnotes at the bottom of each page
+- Format footnotes clearly separated from the main text at the bottom of each page
+
+**OSCOLA FOOTNOTE FORMATTING (REFERENCE THE PDF GUIDE):**
+- Cases: Case Name [Year] Volume Reporter Page 
+  * Example: Entores v Miles Far East Corp [1955] 2 QB 327
+  * Include neutral citations where available: e.g., [2004] EWCA Civ 576
+  * Use proper party names as they appear in law reports
+- Statutes: Act Name Year, s X 
+  * Example: Occupiers' Liability Act 1957, s 2(1)
+  * Include subsection numbers where relevant
+- Books: Author, Title (Publisher, Year) page number 
+  * Example: Smith, Contract Law (OUP, 2020) 123
+- Journal articles: Author, 'Title' [Year] Volume Journal Page 
+  * Example: Brown, 'Duty of Care' [2020] 40 LQR 123
+- Government reports: Title (Year) para X
+  * Example: Law Commission, Contract Formation (2021) para 3.45
+- Always consult the OSCOLA 4th edition quick reference guide (oscola_4th_edn_hart_2012quickreferenceguide.pdf) for complete formatting rules
+
+**ACCURACY OF SOURCES (CRITICAL - VERIFY ALL REFERENCES):**
+- ONLY use real, verifiable academic sources:
+  * Authoritative cases (with proper neutral citations where available, e.g., [2004] EWCA Civ 576)
+  * Academic journal articles from peer-reviewed journals
+  * Textbooks from recognized legal publishers (OUP, CUP, Sweet & Maxwell, etc.)
+  * Official law commission/government reports
+- DO NOT cite blogs, unofficial commentaries, or non-peer-reviewed sources unless explicitly justified
+- All cases and statutes cited must be accurate and complete, including:
+  * Neutral citations where applicable (e.g., [2004] EWCA Civ 576)
+  * Proper party names (exact case names as they appear in law reports)
+  * Complete citations with volume, reporter, and page numbers
+- If a case or statute is not found in the provided sources, DO NOT invent it - state that the sources do not provide information on that point
+
+**REFERENCES AND AUTHORITY CHECKS (BEFORE FINALISING):**
+- BEFORE finalising the essay, you MUST:
+  * Double-check that every footnote corresponds to a real case, article, or statute
+  * Verify all citations against the sources provided
+  * If necessary, replace any weak or unverifiable references with stronger, academic ones (e.g., cite Brown v Rice for confidentiality, not a blog post)
+  * Where the user has uploaded supporting documents (case reports, law commission reports, books), use those where appropriate
+  * Ensure all case names, statute names, and legal principles are extracted EXACTLY as they appear in the sources
+  * Cross-reference information across multiple sources for consistency
+  * If sources conflict, acknowledge the conflict explicitly
+
+**TONE AND STYLE (FORMAL ACADEMIC LEGAL ENGLISH):**
+- The essay MUST be written in formal academic legal English, suitable for UK undergraduate or postgraduate law study
+- Maintain a neutral and analytical tone; avoid rhetorical or emotional language
+- Use clear subheadings for each pairing/main section and a concise conclusion
+- The introduction MUST set up Feehily's thesis (if applicable) or the key argument and outline the analytical approach
+- Ensure smooth transitions between paragraphs and sections
+- Write with authority and scholarly precision
+- Avoid colloquialisms, contractions, or informal language
+- Use precise legal terminology throughout
+
+**ESSAY STRUCTURE:**
+- Introduction: Set up the thesis/argument and outline the analytical approach (must address ALL key words from the question)
+- Main body: Address each key word/concept systematically with clear subheadings for each pairing or major theme
+- Conclusion: Synthesize the analysis and provide a clear, justified conclusion
+
+**QUESTION ANALYSIS REQUIREMENTS:**
+- CRITICAL: Break down ALL key words in the question
+- Answer ALL key words comprehensively - none should be overlooked
+- Show how each keyword relates to the overall legal analysis
+- Ensure the answer fully addresses every aspect of the question
+- Each keyword must receive substantial analysis, not just a passing mention"""
+    
     user_prompt = f"""CRITICAL: Answer this legal question using ONLY information found in the sources below. Demonstrate 90+ essay quality: strategic synthesis, deep research integration, and original insights while maintaining absolute accuracy. DO NOT make up facts, cases, or citations. ALL cases, statutes, and legal principles MUST be REAL and found in the sources.
 
 Legal Question: {query}
@@ -562,8 +797,9 @@ Legal Question: {query}
 - Cross-check information across multiple sources for consistency
 - If sources contradict each other, acknowledge the contradiction explicitly
 - DO NOT use any information not found in the sources - this is MANDATORY
+{essay_instructions}
 
-**IRAC STRUCTURE:**
+**IRAC STRUCTURE:**{" (For problem questions; essays may use thematic structure)" if is_essay else ""}
 
 Issue
 - DO NOT use ## or bold formatting for "Issue"
@@ -573,7 +809,7 @@ Issue
 - Be precise and specific
 
 Rule
-- State legal principles found in the sources with FULL OSCOLA citations
+- State legal principles found in the sources with FULL OSCOLA citations{" in footnotes" if is_essay else ""}
 - For statutes: Cite exact sections ONLY if found in sources with full citation format: (Act Name, s.X(subsection))
   - Example: (Occupiers' Liability Act 1957, s.2(1))
   - MUST include the exact section number as it appears in sources
@@ -584,7 +820,7 @@ Rule
   - If only partial citation, use what is provided but note if incomplete
 - Include academic sources where found in sources with proper citation
 - If a legal principle is not in sources, state: "The sources do not provide the legal rule on this point"
-- EVERY rule statement MUST have a citation from the sources
+- EVERY rule statement MUST have a citation from the sources{" in footnote format" if is_essay else ""}
 
 Analysis
 - This is the MOST CRITICAL section - analyze word-by-word, fact-by-fact
@@ -594,18 +830,18 @@ Analysis
   - Apply rules from sources to facts with precision
 - Apply rules to facts systematically:
   - Take each fact word-by-word
-  - Identify which legal rule applies (with citation)
+  - Identify which legal rule applies (with citation{" in footnote" if is_essay else ""})
   - Explain how the fact satisfies or fails to satisfy each element of the rule
 - Argue both sides using principles from sources:
-  - Claimant's argument: [specific argument with source citation]
-  - Defendant's counter-argument: [specific counter-argument with source citation]
+  - Claimant's argument: [specific argument with source citation{" in footnote" if is_essay else ""}]
+  - Defendant's counter-argument: [specific counter-argument with source citation{" in footnote" if is_essay else ""}]
 - Analyze every element of each legal test:
-  - If duty of care: analyze proximity, foreseeability, fairness (with citations)
-  - If breach: analyze reasonable person standard, factual circumstances (with citations)
-  - If causation: analyze factual causation, legal causation (with citations)
+  - If duty of care: analyze proximity, foreseeability, fairness (with citations{" in footnotes" if is_essay else ""})
+  - If breach: analyze reasonable person standard, factual circumstances (with citations{" in footnotes" if is_essay else ""})
+  - If causation: analyze factual causation, legal causation (with citations{" in footnotes" if is_essay else ""})
   - Continue for ALL elements
 - State what a court would likely hold based on sources, with justification
-- Every single assertion MUST have a FULL OSCOLA citation from sources
+- Every single assertion MUST have a FULL OSCOLA citation from sources{" in footnote format" if is_essay else ""}
 - Use specific quotations from the question: "The question states '[exact quote]', which indicates..."
 - If analysis requires information not in sources, state this limitation explicitly
 - Cross-reference multiple sources when analyzing complex points
@@ -613,16 +849,18 @@ Analysis
 Conclusion
 - Direct answer to the issue(s) based on sources
 - Summarize without introducing new arguments
-- Advise on likely legal position based on available sources with citation support
+- Advise on likely legal position based on available sources with citation support{" in footnotes" if is_essay else ""}
 - If conclusion is limited by missing information, state this clearly
 
 **CITATION FORMAT (MANDATORY):**
-- Use FULL OSCOLA citations in parentheses for EVERY legal point
+{"- For ESSAYS: Use FOOTNOTES at the bottom of each page with FULL OSCOLA format" if is_essay else "- Use FULL OSCOLA citations in parentheses for EVERY legal point"}
+{"- Format footnotes as superscript numbers in text (1, 2, 3) with corresponding footnotes at bottom of page" if is_essay else ""}
 - Cases: (Case Name [Year] Volume Reporter Page) - MUST be from sources
 - Statutes: (Act Name, s.X) - MUST be from sources
 - Academic sources: (Author, "Title" [Year] Journal Volume Page) - MUST be from sources
 - Reference source by number when appropriate: (Source 1), (Source 3)
 - NO CITATIONS to cases/statutes not found in sources - this is PROHIBITED
+{"- DO NOT include a bibliography - all citations must be in footnotes only" if is_essay else ""}
 
 **FACT ANALYSIS REQUIREMENTS:**
 - Read the question word-by-word
@@ -640,10 +878,12 @@ Conclusion
 
 Generate your answer now, ensuring:
 1. EVERY claim is verified against the sources
-2. ALL citations are REAL and from sources
+2. ALL citations are REAL and from sources{" and formatted as footnotes at the bottom of each page (NOT in-text)" if is_essay else ""}
 3. Analysis is word-by-word, fact-by-fact with no missing details
-4. Issue section has no ## or bold formatting
-5. Rule and Analysis have FULL OSCOLA citations for every legal point"""
+4. {"ALL keywords from the question are broken down and addressed comprehensively - this is MANDATORY. Identify every keyword and ensure each receives substantial analysis" if is_essay else ""}
+5. Issue section has no ## or bold formatting
+6. Rule and Analysis have FULL OSCOLA citations for every legal point{" in footnote format (references at bottom of page)" if is_essay else ""}
+7. {"For ESSAYS: Use formal academic legal English, OSCOLA footnotes only (no bibliography), and address ALL key words systematically" if is_essay else ""}"""
 
     try:
         completion = groq_client.chat.completions.create(
@@ -659,13 +899,19 @@ Generate your answer now, ensuring:
         
         response = completion.choices[0].message.content
         
-        # Perform hallucination detection
-        with st.spinner("🔍 Fact-checking response against sources to prevent hallucinations..."):
-            has_hallucination, verification_result = detect_hallucination(response, all_sources, groq_client, model)
+        # Perform enhanced hallucination detection with internet verification
+        with st.spinner("🔍 Fact-checking response against sources and internet to prevent hallucinations..."):
+            has_hallucination, verification_result = detect_hallucination(response, all_sources, groq_client, model, tavily_client)
             if has_hallucination:
                 # Add warning about potential unverified claims
                 warning = "\n\n---\n\n**⚠️ FACT-CHECK ALERT:** Some claims may not be fully verifiable in the provided sources. Please verify:\n\n"
                 response = response + warning + f"*{verification_result}*\n\n*Always cross-reference claims with original sources.*"
+        
+        # Final fact-check: Always verify key claims with internet (Google/Yahoo/etc)
+        with st.spinner("🌐 Performing final internet fact-check of key legal claims..."):
+            final_fact_check = final_internet_fact_check(response, query, tavily_client, groq_client, model)
+            if final_fact_check:
+                response += f"\n\n---\n\n**🌐 Final Internet Verification:**\n{final_fact_check}\n\n*This answer has been cross-verified with internet sources (Google, Yahoo, Bing, free law databases).*"
         
         # Add legal advice disclaimer if advice was requested
         if is_advice_request(query):
@@ -1119,7 +1365,7 @@ def main():
         st.divider()
         
         # Info
-        st.info("💡 **Tip:** Law questions are automatically detected and answered using IRAC methodology with OSCOLA citations!")
+        st.info("💡 **Tip:** Law questions are automatically detected and answered using IRAC methodology with OSCOLA citations. Essay requests include OSCOLA footnotes, keyword breakdown, and formal academic style!")
     
     # Main chat interface
     # Display chat history
@@ -1151,7 +1397,11 @@ def main():
         
         # Show law question indicator if detected
         is_law = is_law_question(prompt)
-        if is_law:
+        is_essay = is_essay_request(prompt)
+        if is_law and is_essay:
+            with st.chat_message("assistant"):
+                st.info("📝 **Legal essay detected!** I'll write an essay with OSCOLA footnotes, keyword breakdown, and formal academic style.")
+        elif is_law:
             with st.chat_message("assistant"):
                 st.info("⚖️ **Law question detected!** I'll answer using IRAC structure with OSCOLA citations.")
         

@@ -199,9 +199,27 @@ A comprehensive **Streamlit-based web application** has been created that provid
 
 #### 1. Install Dependencies
 
+**Quick Install (Recommended):**
+```bash
+chmod +x install_rag.sh
+./install_rag.sh
+```
+
+**OR Manual Install:**
 ```bash
 pip install -r requirements.txt
+
+# Install FAISS (required for full RAG features)
+# Option 1: Using conda (easiest)
+conda install -c pytorch faiss-cpu
+
+# Option 2: Install SWIG first, then FAISS
+# macOS: brew install swig && pip install faiss-cpu
+# Ubuntu: sudo apt-get install swig && pip install faiss-cpu
+# Windows: Download SWIG from https://swig.org, add to PATH, then pip install faiss-cpu
 ```
+
+**📝 See [SETUP.md](SETUP.md) for detailed installation instructions.**
 
 #### 2. Set Up API Keys
 

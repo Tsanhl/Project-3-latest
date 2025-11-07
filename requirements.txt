@@ -7,9 +7,25 @@ python-docx>=1.1.0
 langchain>=0.1.0
 langchain-core>=0.1.0
 langchain-community>=0.0.29
-faiss-cpu>=1.7.4
 sentence-transformers>=2.2.2
 numpy>=1.24.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+
+# FAISS installation (choose one method):
+# Method 1 (Recommended): Use conda (if available)
+# conda install -c pytorch faiss-cpu
+# OR
+# Method 2: Install from conda-forge wheel
+# pip install faiss-cpu --extra-index-url https://download.pytorch.org/whl/cpu
+# OR
+# Method 3: Install SWIG first, then faiss-cpu
+# On macOS: brew install swig (or download from https://swig.org)
+# On Ubuntu/Debian: sudo apt-get install swig
+# On Windows: Download from https://swig.org/download.html
+# Then: pip install faiss-cpu
+# OR
+# Method 4: Use pre-built wheel (Python 3.8-3.11 only)
+# pip install https://github.com/facebookresearch/faiss/releases/download/v1.7.4/faiss-cpu-1.7.4-cp311-cp311-macosx_10_9_arm64.whl
+faiss-cpu>=1.7.4; python_version<"3.12"
